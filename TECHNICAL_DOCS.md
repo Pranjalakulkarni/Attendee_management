@@ -1,0 +1,292 @@
+# Technical Documentation — Gatehouse
+
+Full reference for architecture, data model, API surface, testing, and
+deployment. See `README.md` for the quick-start version of this.
+
+## 1. Architecture
+
+```
+Event Data (attendees, checkins, venues, speakers, sessions,
+            sponsors, incidents - all in SQLite)
+        │
+        ▼
+┌───────────────────────────────────────────────────────────┐
+│  AI Agents (Milestones 1-3, each a plain Python module)   │
+│  insights · venue_agent · speaker_agent · session_analytics│
+│  sponsor_agent · incident_agent · ops_analytics            │
+└───────────────────────────────────────────────────────────┘
+        │
+        ▼
+┌───────────────────────────────────────────────────────────┐
+│  Agent Orchestration (intelligence_engine.orchestrate_     │
+│  agents) - runs every agent's read logic together in one   │
+│  pass                                                       │
+└───────────────────────────────────────────────────────────┘
+        │
+        ▼
+┌───────────────────────────────────────────────────────────┐
+│  Event Intelligence Engine (intelligence_engine.py)        │
+│  KPIs · trend detection · operational risk detection ·     │
+│  unified recommendations                                    │
+└───────────────────────────────────────────────────────────┘
+        │
+        ▼
+┌───────────────────────────────────────────────────────────┐
+│  Executive Dashboard (frontend, "Executive Dashboard"      │
+│  section) - health score, live trends, risk alerts,        │
+│  recommendations, agent status - polls every 15s            │
+└───────────────────────────────────────────────────────────┘
+        │
+        ▼
+   Decision Making (a human, looking at the dashboard)
+```
+
+This mirrors the brief's own flow diagram: *Event Data → AI Agents → Agent
+Orchestration → Event Intelligence Engine → Executive Dashboards → Alerts
+& Recommendations → Decision Making.*
+
+**Why agents are plain modules, not classes/microservices:** each agent
+(`venue_agent.py`, `incident_agent.py`, etc.) is a set of functions that
+take a database connection and return data or apply a change. No agent
+holds hidden state or talks to another agent directly - orchestration
+happens one layer up, in `intelligence_engine.py`, which imports and calls
+each agent module. This keeps every agent independently testable (see
+`tests/test_e2e.py`) and means adding a new agent never requires touching
+an existing one.
+
+**Backend**: FastAPI + SQLite, single process, no build step.
+**Frontend**: one `index.html`, vanilla JS + Chart.js (vendored inline,
+not a CDN dependency), no build step, no framework.
+**Real-time**: a mix of genuine push (WebSocket for check-ins) and short
+polling (15-20s, for everything else) - see section 6.
+
+## 2. Data model
+
+All tables live in `backend/database.py`. Key relationships:
+
+```
+attendees ──< checkins
+venues ──< sessions >── speakers ──< speaker_availability
+sponsors ──< sponsor_deliverables
+sponsors ──< sponsor_engagement
+incidents (standalone)
+```
+
+**Timestamp convention (important):** `attendees.registered_at`,
+`checkins.checkin_time`, and every `incidents.*` timestamp are
+timezone-**aware** (produced by `database.now_iso()`). `venues`/`speakers`/
+`sessions` timestamps are timezone-**naive** (they mirror the browser's
+`<input type="datetime-local">` values directly). Comparing a naive and an
+aware datetime raises `TypeError` - this has caused real bugs in earlier
+milestones. Any new code touching both families of timestamps (like
+`intelligence_engine.py` does) must keep two separate "now" values and
+never cross them. This is called out explicitly in a comment at the top of
+`intelligence_engine.py`.
+
+## 3. Agent reference
+
+| Agent | File | Responsibility |
+|---|---|---|
+| Attendee Insights | `insights.py` | Registration/check-in analytics, rule-based + optional Claude narrative insights |
+| Venue Agent | `venue_agent.py` | Allocation by capacity/amenities, double-booking detection, live free/occupied status |
+| Speaker Agent | `speaker_agent.py` | Topic-based matching, availability windows, double-booking detection |
+| Session Analytics | `session_analytics.py` | Scheduling health, conflict/utilization stats |
+| Sponsorship Agent | `sponsor_agent.py` | Tiers, deliverables, engagement tracking, prospect search & outreach drafting |
+| Incident Agent | `incident_agent.py` | Lifecycle management, automatic severity-based escalation (runs on a 30s background timer), live alert feed |
+| Ops Analytics | `ops_analytics.py` | Combines sponsor + incident data into one analytics/insights layer |
+| **Event Intelligence Engine** | `intelligence_engine.py` | Orchestrates every agent above; KPIs, trends, cross-module risk detection, unified recommendations |
+
+## 4. API reference
+
+Base URL: `http://localhost:8000`. All request/response bodies are JSON
+unless noted. Full interactive docs are also auto-generated by FastAPI at
+`/docs` (Swagger UI) and `/redoc`.
+
+### Attendees (Milestone 1)
+`POST /api/attendees` · `GET /api/attendees` · `GET /api/attendees/{id}` ·
+`PUT /api/attendees/{id}` · `DELETE /api/attendees/{id}` ·
+`POST /api/import/csv` · `POST /api/import/json` ·
+`POST /api/checkin/lookup` · `POST /api/checkin/{id}` ·
+`POST /api/checkout/{id}` · `GET /api/checkin/feed` ·
+`GET /api/analytics/summary` · `GET /api/insights` ·
+`WS /ws/checkins` (live check-in broadcast)
+
+### Venues & Speakers (Milestone 2)
+`POST|GET /api/venues` · `GET /api/venues/available` ·
+`GET /api/venues/live-status` · `GET|PUT|DELETE /api/venues/{id}` ·
+`POST|GET /api/speakers` · `GET /api/speakers/available` ·
+`GET|PUT|DELETE /api/speakers/{id}` ·
+`POST|GET /api/speakers/{id}/availability` ·
+`DELETE /api/speakers/{id}/availability/{aid}` ·
+`POST|GET /api/sessions` · `GET|PUT|DELETE /api/sessions/{id}` ·
+`POST /api/sessions/{id}/auto-assign` · `GET /api/scheduling/conflicts` ·
+`POST /api/scheduling/optimize` · `GET /api/session-analytics/summary` ·
+`GET /api/session-insights`
+
+### Sponsorship & Incidents (Milestone 3)
+`POST|GET /api/sponsors` · `GET /api/sponsors/search` ·
+`GET /api/sponsors/industries` · `GET|PUT|DELETE /api/sponsors/{id}` ·
+`POST /api/sponsors/{id}/approach` ·
+`POST|GET|PUT|DELETE /api/sponsors/{id}/deliverables[/{did}]` ·
+`POST|GET /api/sponsors/{id}/engagement` ·
+`POST|GET /api/incidents` · `GET /api/incidents/alerts` ·
+`GET|PUT|DELETE /api/incidents/{id}` ·
+`POST /api/incidents/{id}/resolve` · `POST /api/incidents/{id}/escalate` ·
+`GET /api/ops-analytics/summary` · `GET /api/ops-insights` ·
+`GET /api/reports/sponsors.csv` · `GET /api/reports/incidents.csv`
+
+### Event Intelligence Engine (Milestone 4)
+`GET /api/intelligence/summary` — the Executive Dashboard's single data
+source: KPIs, trends, risks, recommendations, and the full orchestrated
+output of every agent. Cached server-side for 5 seconds.
+`GET /api/intelligence/risks` · `GET /api/intelligence/recommendations` ·
+`GET /api/intelligence/kpis` · `GET /api/health` (liveness/readiness probe)
+
+### Route-ordering rule (read this before adding a new route)
+
+Every literal sub-path like `/api/venues/available` or
+`/api/incidents/alerts` **must** be declared in `main.py` before its
+sibling `/api/venues/{venue_id}` / `/api/incidents/{incident_id}` route.
+FastAPI matches routes in declaration order; if the `{id}` route comes
+first, a request to `/available` gets matched against it with
+`venue_id="available"`, which fails int parsing and returns a confusing
+422 instead of reaching the intended handler. This has broken this app
+more than once. `tests/test_e2e.py` has a dedicated regression-guard
+section for exactly this class of bug - if you add a new literal
+sub-path, add a check there too.
+
+## 5. Testing
+
+`backend/tests/test_e2e.py` is a real, runnable, self-contained suite (no
+pytest/mocking framework - just `requests`, already in `requirements.txt`).
+It boots its own disposable server against a temp-directory copy of the
+database, and covers:
+
+- **Functional & API testing** - every major endpoint across all 4 milestones
+- **Integration/workflow testing** - real multi-step flows: register → check in
+  → reject a duplicate check-in; report → escalate → resolve an incident;
+  create a prospect → approach them → confirm the status flip
+- **AI/agent testing** - intelligence engine endpoints, orchestration count
+- **Dashboard testing** - confirms the served HTML actually contains every
+  panel/section the JS depends on (this app has no build step, so the
+  served markup *is* the source of truth)
+- **Performance testing** - times the heaviest endpoint (intelligence
+  summary) cold and cached, and asserts the cache is actually working
+  (identical `generated_at` on a repeat call within the TTL window)
+- **Security testing** - security headers present; 60 rapid requests all
+  succeed (proves the rate limiter doesn't false-positive on normal load)
+- **Error handling** - 404s, 409 conflicts, 422 validation errors
+- **Route-ordering regression guard** - see section 4
+
+Run it: `cd backend && python tests/test_e2e.py`. Wired into CI via
+`.github/workflows/ci.yml` on every push/PR.
+
+### User Acceptance Testing (manual - not automatable)
+
+UAT is inherently about a human judging real usability, so it isn't part
+of the automated suite. Suggested checklist for a person to walk through
+before sign-off:
+
+- [ ] Register an attendee, check them in, watch **Live Arrivals** update
+      in a second open tab in real time (no refresh)
+- [ ] Create a session with no venue/speaker specified and confirm the
+      Venue/Speaker Agents auto-assign sensibly
+- [ ] Deliberately create a venue double-booking, confirm it shows up
+      under **Scheduling Conflicts**, then run the optimizer and confirm
+      it resolves
+- [ ] Search for a sponsor by industry + minimum contract value, click
+      **Approach**, confirm the drafted email reads naturally and the
+      sponsor's status updates
+- [ ] Report an incident with high severity, leave it open past its time
+      budget, confirm it auto-escalates without you touching it again
+- [ ] Open **Executive Dashboard**, confirm the health score and KPIs
+      match what the individual tabs show
+- [ ] Create a session starting soon with expected attendance near a
+      venue's capacity, confirm a crowd-density risk appears on the
+      Executive Dashboard within ~15 seconds
+
+## 6. Real-time behavior
+
+| Feature | Mechanism | Interval |
+|---|---|---|
+| Check-in feed | WebSocket push (`/ws/checkins`) | instant |
+| Venue live status | Polling | 20s |
+| Incident alerts | Polling | 20s |
+| Incident auto-escalation | Server-side background task | 30s |
+| Ops Analytics | Polling | 20s |
+| Executive Dashboard | Polling | 15s (server-cached 5s) |
+
+Polling (not WebSockets) was the deliberate choice for most of these:
+it's simpler to reason about, survives a dropped connection without any
+reconnect logic, and at these intervals the server-side cache on the
+heaviest endpoint keeps the actual DB load negligible even with several
+tabs open.
+
+## 7. Security review
+
+- **SQL injection**: every query is parameterized (`?` placeholders).
+  The few places that build a `SET {columns} = ?` clause dynamically
+  (partial updates) only interpolate **column names**, and those names
+  come exclusively from the request's Pydantic `*Update` schema's own
+  declared fields via `.model_dump()` - never from arbitrary user input.
+  A malicious payload can only supply *values* for fields the schema
+  already defines, which go through the parameterized values, not the
+  interpolated SQL text. Reviewed across every module; no exceptions found.
+- **CORS**: configurable via `ALLOWED_ORIGINS`, defaults to `*` for local dev.
+- **Security headers**: `X-Content-Type-Options`, `X-Frame-Options`,
+  `Referrer-Policy` on every response.
+- **Rate limiting**: in-memory sliding window, 240 req/min/IP. Resets per
+  process - fine for a single instance, needs a shared store (Redis) for
+  a multi-process/multi-container deployment.
+- **Authentication**: optional shared-secret `API_KEY` (see `.env.example`
+  and the comment block above `_api_key_auth` in `main.py`), off by
+  default. This protects the API from external callers but is not a full
+  user-login system - there's no per-user identity, roles, or session
+  management. The bundled dashboard has no login form by design (this was
+  built as an internal ops tool). **A real production deployment serving
+  external users should add proper authentication** - JWT + a FastAPI
+  dependency (`Depends(get_current_user)`) is the natural fit given the
+  existing route structure; budget this as the top priority before any
+  public-facing deployment.
+- **Error handling**: a global exception handler logs the real error
+  server-side and returns a generic message to the client - no stack
+  traces or internal paths ever leak in a response.
+- **Logging**: structured request logging (method, path, status, timing)
+  plus explicit logging of incident auto-escalations, at `INFO` level by
+  default (`LOG_LEVEL` env var).
+
+## 8. Performance notes
+
+- **WAL journal mode** (`database.py`) lets reads proceed without blocking
+  on a concurrent writer - matters here since the dashboard polls every
+  15-20s while other tabs may be writing.
+- **Indexes** on every column used in a `WHERE`/`ORDER BY` in a hot path
+  (see the `CREATE INDEX` statements in `database.py`), including ones
+  added specifically for the Intelligence Engine's trend queries
+  (`attendees.registered_at`, `checkins.checkin_time`,
+  `incidents.created_at`).
+- **5-second server-side cache** on `/api/intelligence/summary`, the most
+  expensive read in the app (it orchestrates every agent). Several open
+  dashboard tabs polling in parallel collapse into one real computation
+  per cache window.
+- **Scaling ceiling**: SQLite allows only one writer at a time. Fine at
+  this app's current scale (a single event's worth of data); the natural
+  next step for higher write concurrency is Postgres, and `database.py`
+  deliberately isolates all SQL behind `get_conn()` so that swap doesn't
+  touch route logic.
+
+## 9. Deployment
+
+See `README.md`'s "Production deployment" section for environment
+variables and the `gunicorn` command. Additional artifacts in this repo:
+
+- `Dockerfile` — containerized build; seeds demo data only if no database
+  already exists at the mounted volume, so redeploys never wipe real data.
+  *(Not build-tested in this environment - Docker wasn't available here;
+  review before relying on it for a real deploy.)*
+- `.env.example` — every environment variable this app reads, documented.
+- `scripts/backup_db.sh` — SQLite-safe backup (uses `.backup`, not a raw
+  file copy, so it can't capture a corrupt mid-write snapshot), prunes
+  backups older than 14 days. Wire it into cron or your platform's
+  scheduled-job feature for real production use.
+- `.github/workflows/ci.yml` — runs the full E2E suite on every push/PR.
